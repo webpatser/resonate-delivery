@@ -77,14 +77,14 @@ class MessageLog
             return [];
         }
 
-        return array_map(static fn (array $entry) => self::decode($entry), $raw);
+        return array_values(array_map(static fn (array $entry) => self::decode($entry), $raw));
     }
 
     /**
      * Decode one raw `[id, [field1, val1, field2, val2, ...]]` entry into a
      * convenient associative shape.
      *
-     * @param  array{0: string, 1: list<string>}  $entry
+     * @param  array<int, mixed>  $entry
      * @return array{id: string, event: string, data: array<string, mixed>}
      */
     private static function decode(array $entry): array

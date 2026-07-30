@@ -123,7 +123,7 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
         unset($stash[$name]);
         $connection->setState('delivery.subscribes', $stash);
 
-        $this->replay($connection, $channel, $lastId);
+        $this->replay($connection, $channel, $lastId, $this->redis);
     }
 
     /**
@@ -158,14 +158,14 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     /**
      * Read missed messages and send each to the connection in order.
      */
-    protected function replay(Connection $connection, Channel $channel, string $lastId): void
+    protected function replay(Connection $connection, Channel $channel, string $lastId, RedisClient $redis): void
     {
         $key = $this->keys->streamKey($connection->app()->id(), $channel->name());
         $cursor = '('.$lastId;
 
         while (true) {
             try {
-                $raw = $this->redis->execute('XRANGE', $key, $cursor, '+', 'COUNT', (string) $this->batchSize);
+                $raw = $redis->execute('XRANGE', $key, $cursor, '+', 'COUNT', (string) $this->batchSize);
             } catch (Throwable) {
                 return;
             }

@@ -52,7 +52,7 @@ class ReplayBroadcaster implements Broadcaster
      * Signature matches Laravel's `Broadcaster::broadcast` (untyped `$event`,
      * no return type) so it can be plugged in as a regular broadcaster.
      *
-     * @param  array<int, string|object>  $channels
+     * @param  array<int, string|\Stringable>  $channels
      * @param  array<string, mixed>  $payload
      */
     public function broadcast(array $channels, $event, array $payload = [])

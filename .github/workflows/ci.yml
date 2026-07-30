@@ -13,6 +13,17 @@ jobs:
     runs-on: ubuntu-latest
     name: PHP 8.5
 
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,6 +40,12 @@ jobs:
 
       - name: Audit dependencies for known vulnerabilities
         run: composer audit --no-dev
+
+      - name: Check code style
+        run: ./vendor/bin/pint --test
+
+      - name: Run static analysis
+        run: ./vendor/bin/phpstan analyse
 
       - name: Run tests
         run: ./vendor/bin/pest
