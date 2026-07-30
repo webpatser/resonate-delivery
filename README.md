@@ -12,7 +12,7 @@ Solves the single most common WebSocket complaint: "I dropped for 20 seconds and
 
 ## What this is (and isn't)
 
-- **At-least-once within retention.** With the default cap of 1000 messages per channel, a client that drops for 5 minutes on a low-traffic channel reconnects seamlessly. A client offline for hours on a high-traffic channel sees a clean break — design retention based on expected disconnect duration and your publish rate.
+- **At-least-once within retention.** With the default cap of 1000 messages per channel, a client that drops for 5 minutes on a low-traffic channel reconnects seamlessly. A client offline for hours on a high-traffic channel sees a clean break; design retention based on expected disconnect duration and your publish rate.
 - **Duplicates can happen at the seam.** A message published exactly as a reconnecting client is mid-replay may arrive both in the replay and as a live broadcast. Each message carries a monotonic `_replay_id`; the client deduplicates by it.
 - **No ACK protocol.** This is not a message queue. A subscriber that goes away forever does not hold a slot in any per-subscriber outbox. Per-subscriber state lives only on the connection.
 - **Server broadcasts only in v0.1.** `client-*` whispers between clients are not logged; they reach connected subscribers only.

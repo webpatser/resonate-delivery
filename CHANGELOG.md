@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-30
+
+### Changed
+
+- Widen the `webpatser/resonate` constraint to `^0.4|^0.5`. Composer treats a
+  `^0.4` caret on a 0.x package as `>=0.4 <0.5`, so this package could not be
+  installed next to a server running Resonate v0.5 even though the suite passes
+  against it. Both major lines are now accepted.
+
+## [0.1.1] - 2026-07-30
+
+### Fixed
+
+- `MessageLog::decode()` carried an array-shape docblock that did not match what
+  it returns.
+- `Broadcasting\ReplayBroadcaster::broadcast()` narrowed its object cast to
+  `Stringable` instead of casting an arbitrary object.
+- `MessageReplayPlugin::replay()` no longer re-reads the nullable `RedisClient`
+  property. The already null-checked client is passed in from the caller.
+
+### Changed
+
+- CI runs the suite against a `redis:7` service container mapped to
+  `127.0.0.1:6379`. The `fsockopen()` probe in `tests/Pest.php` had been
+  self-skipping most of the suite in the pipeline; all 19 tests now run.
+- CI gates on Laravel Pint and on PHPStan at level 8, with no baseline and no
+  suppressions. Plain `phpstan/phpstan` is used rather than larastan, whose
+  Testbench bootstrap crashes under this package's `fledge-fiber` dependency
+  (`FiberHttpServiceProvider` calls `Illuminate\Http\Client\Factory::globalHandler`,
+  which does not exist outside a Fledge application).
+- Added a tests and dependency-audit workflow: the suite runs on PHP 8.5 and
+  `composer audit` fails the build on known-vulnerable production dependencies,
+  on push to the default branch and on pull requests.
+
 ## [0.1.0] - 2026-05-25
 
 Initial release.
