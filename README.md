@@ -16,8 +16,9 @@ Solves the single most common WebSocket complaint: "I dropped for 20 seconds and
 - **Ordered.** Everything replayed reaches the client before any live broadcast on that channel, and each side is in publish order. See [Ordering](#ordering).
 - **Duplicates can happen at the seam.** A message published exactly as a reconnecting client is subscribing may arrive both in the replay and as a live broadcast. The live copy always arrives second, so it never reorders anything; the client deduplicates on the monotonic `_replay_id`.
 - **Best-effort logging, never an availability risk.** If the delivery Redis is unreachable, the broadcast still goes out live; it is simply not logged and carries no `_replay_id`. A durability add-on must not be able to take down the broadcasting it was added to.
+- **Bounded replays.** One replay buffers at most `replay_max_messages` (default 10000) messages for a connection; beyond that it is truncated and logged. The stream's own `MAXLEN` normally bites first.
 - **No ACK protocol.** This is not a message queue. A subscriber that goes away forever does not hold a slot in any per-subscriber outbox. Per-subscriber state lives only on the connection.
-- **Server broadcasts only in v0.1.** `client-*` whispers between clients are not logged; they reach connected subscribers only.
+- **Server broadcasts only.** `client-*` whispers between clients are not logged; they reach connected subscribers only.
 
 ## Installation
 
