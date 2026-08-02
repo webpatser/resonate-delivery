@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-02
+
+### Fixed
+
+- Allow `webpatser/resonate` v0.6. The constraint excluded it, so this package could not be installed alongside the current server release. Verified against v0.6.0.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added
