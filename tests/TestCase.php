@@ -96,9 +96,11 @@ class TestCase extends Testbench
             'retention' => [
                 'default_max_messages' => 1000,
                 'per_channel' => [],
+                'ttl' => 3600,
             ],
             'replay_id_field' => '_replay_id',
             'replay_batch_size' => 100,
+            'replay_max_messages' => 10000,
             'underlying' => 'reverb',
         ]);
     }

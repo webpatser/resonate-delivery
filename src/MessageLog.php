@@ -17,6 +17,12 @@ use Predis\Client;
  * The retention cap is approximate (`MAXLEN ~ N`): Redis trims in batches for
  * O(1) inserts. The actual stream may briefly hold a few entries beyond the
  * configured cap, never fewer.
+ *
+ * Length is only half of retention. `MAXLEN` bounds one stream; it says nothing
+ * about how many streams exist, and a per-entity channel scheme mints a new key
+ * per entity. `append()` therefore also stamps a TTL on the key, refreshed on
+ * every append, so a channel that stops being written to eventually disappears
+ * while an active one is never at risk.
  */
 class MessageLog
 {
@@ -38,6 +44,11 @@ class MessageLog
      * the id of the last message it saw can use `replaySince()` to get
      * everything newer.
      *
+     * The configured TTL is re-stamped on every append, which costs one extra
+     * round trip and buys a bound on the number of live stream keys. A channel
+     * written to more often than the window never expires; one that goes quiet
+     * takes its key with it.
+     *
      * @param  array<string, mixed>  $data
      *
      * @throws JsonException
@@ -52,6 +63,12 @@ class MessageLog
             'event', $event,
             'data', json_encode($data, JSON_THROW_ON_ERROR),
         ]);
+
+        $ttl = $this->retention->ttl();
+
+        if ($ttl > 0) {
+            $this->redis->executeRaw(['EXPIRE', $key, (string) $ttl]);
+        }
 
         return (string) $id;
     }

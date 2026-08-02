@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The replay ordering guarantee is now true.** `MessageReplayPlugin` read the
+  Redis Stream from `onSubscribe`, by which point the connection had already
+  joined the channel, so every `XRANGE` round trip was a window for another
+  fiber to deliver a live broadcast to the same socket. A client could receive
+  replayed 5 and 6, then live 12, then replayed 7 through 11, and `_replay_id`
+  cannot repair an inversion the client has already applied. The reads now
+  happen in the `pusher:subscribe` interceptor, before the connection joins the
+  channel (where no broadcast can reach it), and the buffered frames are
+  flushed in `onSubscribe`, which performs no I/O and therefore cannot be
+  suspended. Both the README and the class docblock had documented the
+  guarantee the code did not provide.
+- `Broadcasting\ReplayBroadcaster::broadcast()` no longer lets a failed log
+  write abort the broadcast. An unreachable delivery Redis took down live
+  broadcasting for the whole application, so a durability add-on became an
+  availability dependency. The append is now caught per channel: the failure is
+  logged, and the event is still delegated to the underlying broadcaster.
+
+### Added
+
+- `retention.ttl`: the number of seconds a stream key survives its last append,
+  refreshed on every append (default 7 days, `0` disables). `MAXLEN` bounds how
+  long one stream gets but not how many streams exist, so per-entity channels
+  (`private-orders.{id}`) accumulated keys in Redis forever.
+- `replay_max_messages`: a cap on how many messages one replay buffers for a
+  connection (default 10000, `0` removes it), and `replay_batch_size` is now
+  present in the published config rather than documented only in the README.
+
+### Changed
+
+- **Behaviour.** A subscribe carrying `last_event_id` now completes after its
+  missed window has been read, so it takes slightly longer than a plain
+  subscribe. Only that connection waits; the event loop is not blocked.
+- **Behaviour.** A connection already subscribed to a channel gets no replay
+  when it resubscribes with a cursor. It has missed nothing, and replaying
+  would order messages it has already seen behind ones it has not.
+- **Behaviour.** A broadcast whose log write failed is delivered without a
+  `_replay_id` field. The absent field is the signal: clients advance their
+  cursor only on messages that carry one, so an unlogged message is never
+  mistaken for a replayable one.
+- **API.** `DeliveryRetention::__construct()` takes a third argument, `$ttl`
+  (defaults to `0`, so existing callers are unaffected), and exposes
+  `DeliveryRetention::ttl()`.
+- **Internal.** The plugin's connection state key changed from
+  `delivery.subscribes` (a cursor per channel) to `delivery.replay` (buffered
+  frames per channel). Nothing outside the plugin reads it.
+
 ## [0.1.2] - 2026-07-30
 
 ### Changed

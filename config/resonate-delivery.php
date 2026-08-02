@@ -46,6 +46,13 @@ return [
     |
     | Plan for: expected reconnect duration * expected publish rate.
     |
+    | `ttl` bounds the other axis: how long a stream key survives its last
+    | append, in seconds. MAXLEN caps how long one stream gets but never how
+    | many exist, so a per-entity channel scheme ("private-orders.{id}") leaves
+    | a key behind for every entity that was ever broadcast to. The TTL is
+    | refreshed on each append, so an active channel never expires and an idle
+    | one is reclaimed. Set 0 to keep every stream forever.
+    |
     */
 
     'retention' => [
@@ -55,6 +62,8 @@ return [
             // 'presence-chat.*' => 5000,
             // 'private-billing.*' => 100,
         ],
+
+        'ttl' => (int) env('RESONATE_DELIVERY_TTL', 604800),
     ],
 
     /*
@@ -70,6 +79,26 @@ return [
     */
 
     'replay_id_field' => env('RESONATE_DELIVERY_ID_FIELD', '_replay_id'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Replay reads
+    |--------------------------------------------------------------------------
+    |
+    | `replay_batch_size` is the XRANGE page size used while reading a missed
+    | window.
+    |
+    | `replay_max_messages` caps how many messages a single replay buffers for
+    | one connection. The stream's own MAXLEN already bounds this, so the cap
+    | only matters when retention is set far higher than a reconnecting client
+    | could ever use; beyond it the replay is truncated and a warning logged.
+    | Set 0 to remove the cap.
+    |
+    */
+
+    'replay_batch_size' => (int) env('RESONATE_DELIVERY_BATCH_SIZE', 100),
+
+    'replay_max_messages' => (int) env('RESONATE_DELIVERY_MAX_REPLAY', 10000),
 
     /*
     |--------------------------------------------------------------------------

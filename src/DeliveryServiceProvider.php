@@ -34,6 +34,7 @@ class DeliveryServiceProvider extends ServiceProvider
             return new DeliveryRetention(
                 default: (int) ($retention['default_max_messages'] ?? 1000),
                 perChannel: (array) ($retention['per_channel'] ?? []),
+                ttl: (int) ($retention['ttl'] ?? 0),
             );
         });
 

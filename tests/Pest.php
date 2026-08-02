@@ -32,6 +32,22 @@ function presenceAuth(string $socketId, string $channel, string $data, string $s
     return 'app-key:'.hash_hmac('sha256', "{$socketId}:{$channel}:{$data}", $secret);
 }
 
+/**
+ * Yield the event loop so anything already queued gets to run.
+ *
+ * Ordering tests queue a "live" broadcast and then need the current fiber to
+ * suspend before asserting, otherwise the loop is stopped while that callback
+ * is still pending and the live frame never arrives at all.
+ */
+function settle(float $seconds = 0.05): void
+{
+    $suspension = EventLoop::getSuspension();
+
+    EventLoop::delay($seconds, static fn () => $suspension->resume());
+
+    $suspension->suspend();
+}
+
 function runLoop(Closure $body): void
 {
     $error = null;

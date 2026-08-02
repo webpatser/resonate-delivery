@@ -25,7 +25,7 @@ afterEach(function () {
     }
 });
 
-function makeLog(int $default = 1000): MessageLog
+function makeLog(int $default = 1000, int $ttl = 0): MessageLog
 {
     /** @var Client $redis */
     $redis = new Client(['host' => '127.0.0.1', 'port' => 6379, 'database' => 15]);
@@ -33,7 +33,7 @@ function makeLog(int $default = 1000): MessageLog
     return new MessageLog(
         redis: $redis,
         keys: new DeliveryKeys('delivery-test'),
-        retention: new DeliveryRetention(default: $default),
+        retention: new DeliveryRetention(default: $default, ttl: $ttl),
     );
 }
 
@@ -78,6 +78,42 @@ it('returns an empty list when nothing is newer than the cursor', function () {
     $only = $log->append('app-id', 'private-foo', 'A', []);
 
     expect($log->replaySince('app-id', 'private-foo', $only))->toBe([]);
+});
+
+it('expires a stream key so per-entity channels cannot accumulate forever', function () {
+    $log = makeLog(ttl: 3600);
+
+    $log->append('app-id', 'private-orders.42', 'OrderShipped', ['order' => 42]);
+
+    $ttl = (int) $this->redis->executeRaw(['TTL', 'delivery-test:app-id:private-orders.42']);
+
+    expect($ttl)->toBeGreaterThan(0)
+        ->and($ttl)->toBeLessThanOrEqual(3600);
+});
+
+it('refreshes the expiry on every append so an active channel never expires', function () {
+    $log = makeLog(ttl: 3600);
+    $key = 'delivery-test:app-id:private-orders.42';
+
+    $log->append('app-id', 'private-orders.42', 'A', []);
+
+    // Simulate the key ageing towards its expiry, then write again.
+    $this->redis->executeRaw(['EXPIRE', $key, '5']);
+
+    expect((int) $this->redis->executeRaw(['TTL', $key]))->toBeLessThanOrEqual(5);
+
+    $log->append('app-id', 'private-orders.42', 'B', []);
+
+    expect((int) $this->redis->executeRaw(['TTL', $key]))->toBeGreaterThan(5);
+});
+
+it('leaves a stream key persistent when the ttl is disabled', function () {
+    $log = makeLog(ttl: 0);
+
+    $log->append('app-id', 'private-orders.42', 'OrderShipped', []);
+
+    // -1 is "key exists, no expiry".
+    expect((int) $this->redis->executeRaw(['TTL', 'delivery-test:app-id:private-orders.42']))->toBe(-1);
 });
 
 it('caps the stream length under a heavy write load', function () {
