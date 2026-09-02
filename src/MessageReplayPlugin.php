@@ -357,30 +357,24 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     /**
      * Build the fledge-fiber Redis configuration from the connection config.
      *
+     * `RedisConfig::fromParameters()` reads the Laravel-shaped connection array
+     * directly. This used to assemble a `redis://user:pass@host:port/db` string
+     * by hand, and everything a URI cannot carry was dropped on the way: the
+     * `tls` / `rediss` scheme, unix socket paths, `read_timeout`, the retry
+     * settings, the client name and tcp keepalive. A configured `url` still
+     * wins, since that form is a URI to begin with.
+     *
      * @param  array<string, mixed>  $server
      */
     protected function makeConfig(array $server): RedisConfig
     {
-        $timeout = (float) ($server['timeout'] ?? RedisConfig::DEFAULT_TIMEOUT);
-
         if (! empty($server['url'])) {
-            return RedisConfig::fromUri($server['url'], $timeout);
+            return RedisConfig::fromUri(
+                (string) $server['url'],
+                (float) ($server['timeout'] ?? RedisConfig::DEFAULT_TIMEOUT),
+            );
         }
 
-        $host = $server['host'] ?? '127.0.0.1';
-        $port = $server['port'] ?? 6379;
-        $database = $server['database'] ?? 0;
-
-        $userInfo = '';
-
-        if (! empty($server['password'])) {
-            $userInfo = rawurlencode((string) ($server['username'] ?? ''))
-                .':'.rawurlencode((string) $server['password']).'@';
-        }
-
-        return RedisConfig::fromUri(
-            sprintf('redis://%s%s:%s/%s', $userInfo, $host, $port, $database),
-            $timeout,
-        );
+        return RedisConfig::fromParameters($server);
     }
 }

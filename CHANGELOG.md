@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Require `webpatser/fledge-fiber` `^13.29` (was `^13.4`), and build the plugin's connection with `RedisConfig::fromParameters()` rather than a hand-assembled URI. TLS, unix sockets, ACL usernames, `read_timeout`, retry settings, client name and tcp keepalive reach the connection now; a password containing a reserved character used to fail authentication outright. A configured `url` still wins.
+- `connection.scheme` (`RESONATE_DELIVERY_REDIS_SCHEME`, default `tcp`) selects the transport for both halves of the package. The predis broadcaster honours it too, so the writer and the replay reader cannot end up one plaintext and one encrypted.
+
 ## [0.2.1] - 2026-08-02
 
 ### Fixed

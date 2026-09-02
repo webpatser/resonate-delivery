@@ -104,7 +104,7 @@ Pick a window longer than the longest disconnect you intend to support. A client
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `connection` | `REDIS_*` env | Redis server hosting the streams. The broadcaster (predis) and the plugin (fledge async) must point at the same server/database. |
+| `connection` | `REDIS_*` env | Redis server hosting the streams. The broadcaster (predis) and the plugin (fledge async) must point at the same server/database. Takes Laravel's connection keys, `scheme` (`tcp`, `tls`/`rediss`, `unix`) included; both halves honour it. |
 | `key_prefix` | `delivery` | Namespace for stream keys (`{prefix}:{appId}:{channel}`). |
 | `retention.default_max_messages` | `1000` | Default per-channel cap. |
 | `retention.per_channel` | `[]` | fnmatch glob => max messages overrides. |

@@ -97,7 +97,7 @@ class DeliveryServiceProvider extends ServiceProvider
         }
 
         $parameters = [
-            'scheme' => 'tcp',
+            'scheme' => self::predisScheme($server),
             'host' => $server['host'] ?? '127.0.0.1',
             'port' => (int) ($server['port'] ?? 6379),
             'database' => (int) ($server['database'] ?? 0),
@@ -116,5 +116,27 @@ class DeliveryServiceProvider extends ServiceProvider
         }
 
         return $parameters;
+    }
+
+    /**
+     * The predis scheme for a connection block.
+     *
+     * Predis names TLS "tls"; the config accepts the `rediss` spelling too,
+     * because that is what a managed provider publishes and what the async
+     * side understands. Anything else falls through to plain tcp, so a
+     * connection block carrying no scheme behaves exactly as it did before
+     * the key existed.
+     *
+     * @param  array<string, mixed>  $server
+     */
+    protected static function predisScheme(array $server): string
+    {
+        $scheme = strtolower((string) ($server['scheme'] ?? 'tcp'));
+
+        return match ($scheme) {
+            'tls', 'rediss' => 'tls',
+            'unix' => 'unix',
+            default => 'tcp',
+        };
     }
 }
