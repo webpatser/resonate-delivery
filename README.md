@@ -83,9 +83,9 @@ The guarantee is that a reconnecting client sees every replayed message before a
 That is a stronger claim than it looks, because the replay reads Redis and the connection is a live socket the whole time. The plugin gets it by reading before the connection joins the channel, not after:
 
 1. The `pusher:subscribe` interceptor reads the whole missed window into memory. The connection has not joined the channel yet, so a broadcast walking the channel's connection list cannot reach it; the reads can take as many round trips as they need.
-2. Resonate then joins the connection, sends `subscription_succeeded`, and calls the plugin's `onSubscribe`, all as straight-line synchronous code. The plugin writes the buffered frames there and performs no I/O, so no other fiber can run in that window and wedge a live message into the middle of the replay.
+2. Resonate then joins the connection, sends `subscription_succeeded`, and calls every plugin's `onSubscribe`; this plugin writes the buffered frames there. From the join until the last `onSubscribe` has returned, Resonate (0.7.1+) holds every live frame for that connection and delivers them afterwards in arrival order. That holds on scaled presence channels, where Resonate waits for the fleet's member list before confirming, and when another plugin's `onSubscribe` waits on I/O.
 
-A message published after the final read is broadcast by a fiber that cannot run until the flush is finished, so it arrives live, after the replay, in order. Nothing is dropped at that seam.
+A message published after the final read therefore arrives live, after the replay, in order. Nothing is dropped at that seam. A message published just before the final read can arrive twice (replayed, then live); both copies carry the same `_replay_id`, so the client drops the second.
 
 Two consequences worth knowing:
 
@@ -118,7 +118,7 @@ Pick a window longer than the longest disconnect you intend to support. A client
 
 - PHP 8.5+
 - Laravel 13
-- Resonate 0.4+
+- Resonate 0.7.1+ (plugin versions track Resonate's major.minor)
 - Redis 5+ (Redis Streams; included in any modern Redis)
 
 ## Testing

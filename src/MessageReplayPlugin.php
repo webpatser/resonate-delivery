@@ -28,15 +28,16 @@ use function Fledge\Async\Redis\createRedisClient;
  *
  *  - `onSubscribe(Connection, Channel)` fires after `subscription_succeeded`
  *    has been sent. It writes the buffered frames to the connection and
- *    clears the buffer. It performs no I/O, so it cannot suspend.
+ *    clears the buffer. It performs no I/O of its own.
  *
  * ## Why the read happens before the subscribe
  *
  * The ordering guarantee is that replayed messages arrive after
- * `subscription_succeeded` and before any live broadcast. Reading during
- * `onSubscribe` cannot honour that: the connection is already in the channel
- * by then, so every `XRANGE` round trip suspends this fiber and lets another
- * fiber deliver a live broadcast to the same socket. A client could see
+ * `subscription_succeeded` and before any live broadcast. Before Resonate
+ * 0.7.1, reading during `onSubscribe` could not honour that: the connection
+ * was already in the channel by then, so every `XRANGE` round trip suspended
+ * this fiber and let another fiber deliver a live broadcast to the same
+ * socket. A client could see
  * replayed 5 and 6, then live 12, then replayed 7 through 11, and a monotonic
  * `_replay_id` cannot repair an inversion the client has already applied.
  *
@@ -47,23 +48,27 @@ use function Fledge\Async\Redis\createRedisClient;
  *     channel, and a broadcast only walks the channel's connection list, so no
  *     live frame for that channel can reach the socket however long the reads
  *     take.
- *  2. From the moment core adds the connection to the channel, through
- *     `subscription_succeeded` and on into this plugin's flush, Resonate runs
- *     straight-line synchronous code with no suspension point. No other fiber
- *     gets to run in that window, so nothing can wedge a live frame between
- *     the subscribe and the buffered replay.
+ *  2. From the moment core (Resonate 0.7.1+) adds the connection to the
+ *     channel, it holds every live frame for that connection until
+ *     `subscription_succeeded` is out and every plugin's `onSubscribe` has
+ *     returned, then delivers the held frames in arrival order. That holds
+ *     even when core suspends in between (a scaled presence channel asking
+ *     the fleet for its members) or another plugin's `onSubscribe` suspends
+ *     on I/O, so the replay written from `onSubscribe` always precedes both
+ *     the held and the live frames.
  *
  * Nothing is lost at the far seam either. A message appended after the final
- * `XRANGE` is broadcast by a fiber that cannot run until this one suspends,
- * which is after the flush, so the client receives it live and in order. A
- * message appended just before the final read may arrive twice (once replayed,
- * once live, the live copy second); that is the documented duplicate, and the
- * client deduplicates on `_replay_id`.
+ * `XRANGE` reaches the connection live (held first if it lands during the
+ * subscribe), after the replay and in order. A message appended just before
+ * the final read may arrive twice (once replayed, once live, the live copy
+ * second); that is the documented duplicate, and the client deduplicates on
+ * `_replay_id`.
  *
  * Connections that subscribe without `last_event_id` get no replay (the
  * normal Pusher experience), and neither does a connection already subscribed
  * to the channel, because a live subscriber has missed nothing. Buffered state
- * is cleared on flush, on unsubscribe and on connection close.
+ * is cleared on flush, on `pusher:unsubscribe`, on a `pusher:subscribe`
+ * without `last_event_id`, in `onUnsubscribe` and on connection close.
  */
 class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, ServerPlugin
 {
@@ -125,19 +130,49 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
      * can take as many round trips as it needs without a live broadcast
      * slipping in front of the replay.
      *
+     * A `pusher:unsubscribe` drops the channel's buffer here as well. Core
+     * only calls `onUnsubscribe` for a subscription the plugins were told
+     * about, so an unsubscribe that overtakes its own subscribe would
+     * otherwise leave the buffer behind for a later subscribe without
+     * `last_event_id` to replay.
+     *
      * @param  array{event?:mixed,data?:mixed}  $event
      */
     public function onMessage(Connection $from, array $event): MessageDisposition
     {
-        if (($event['event'] ?? null) !== 'pusher:subscribe') {
+        $type = $event['event'] ?? null;
+
+        if ($type !== 'pusher:subscribe' && $type !== 'pusher:unsubscribe') {
             return MessageDisposition::Relay;
         }
 
         $data = (array) ($event['data'] ?? []);
         $channel = (string) ($data['channel'] ?? '');
+
+        if ($type === 'pusher:unsubscribe') {
+            if ($channel !== '') {
+                $this->forget($from, $channel);
+            }
+
+            return MessageDisposition::Relay;
+        }
+
         $lastId = $data['last_event_id'] ?? null;
 
-        if ($this->redis === null || $channel === '' || ! is_string($lastId) || $lastId === '') {
+        // A subscribe without a cursor asks for no replay. Any buffer still
+        // held for the channel belongs to an earlier subscribe that core
+        // rejected (bad auth, subscription limit) and must not be flushed.
+        if ($channel === '') {
+            return MessageDisposition::Relay;
+        }
+
+        if (! is_string($lastId) || $lastId === '') {
+            $this->forget($from, $channel);
+
+            return MessageDisposition::Relay;
+        }
+
+        if ($this->redis === null) {
             return MessageDisposition::Relay;
         }
 
@@ -158,11 +193,11 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     /**
      * Flush the buffered replay for a channel the connection just joined.
      *
-     * This method must never suspend. It runs in the synchronous window that
-     * starts when core adds the connection to the channel, and a suspension
-     * here would hand control to a fiber that could deliver a live broadcast
-     * ahead of the replay, which is exactly the inversion the buffer exists
-     * to prevent.
+     * Core (0.7.1+) holds live frames for the connection from the moment it
+     * joins the channel until every plugin's `onSubscribe` has returned, so
+     * these replay frames always precede the held and live ones, even when
+     * core or another plugin suspends first. A live frame that overlaps the
+     * replay arrives after it and is deduplicated on `_replay_id`.
      */
     public function onSubscribe(Connection $connection, Channel $channel): void
     {
@@ -190,12 +225,7 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
      */
     public function onUnsubscribe(Connection $connection, Channel $channel): void
     {
-        $buffered = $this->buffered($connection);
-
-        if (array_key_exists($channel->name(), $buffered)) {
-            unset($buffered[$channel->name()]);
-            $connection->setState(self::BUFFER, $buffered);
-        }
+        $this->forget($connection, $channel->name());
     }
 
     /**
@@ -294,6 +324,21 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
             $connection->id(),
             $this->context->connectionsOn($connection->app(), $channel),
         );
+    }
+
+    /**
+     * Drop the buffered replay for one channel. A no-op when there is none.
+     */
+    protected function forget(Connection $connection, string $channel): void
+    {
+        $buffered = $this->buffered($connection);
+
+        if (! array_key_exists($channel, $buffered)) {
+            return;
+        }
+
+        unset($buffered[$channel]);
+        $connection->setState(self::BUFFER, $buffered);
     }
 
     /**

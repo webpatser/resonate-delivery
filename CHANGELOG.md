@@ -5,6 +5,19 @@ All notable changes to `webpatser/resonate-delivery` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-23
+
+### Changed
+
+- Versioning now tracks `webpatser/resonate`'s minor version: `0.7.x` targets resonate 0.7.
+- Require `webpatser/resonate` `^0.7.1` (was `^0.4|^0.5|^0.6`), dropping support for resonate 0.6 and earlier. Resonate 0.7.0 could let a live broadcast overtake the replay; 0.7.1 holds broadcasts to a subscribing connection until `subscription_succeeded` and every plugin's `onSubscribe` have returned.
+- The replay seam guarantee (replayed messages after `subscription_succeeded` and before any live broadcast) now also holds on scaled presence channels, where Resonate waits for the fleet before confirming, and when another plugin's `onSubscribe` suspends.
+
+### Fixed
+
+- A `pusher:unsubscribe` now drops the channel's buffered replay in the message interceptor as well as in `onUnsubscribe`. Resonate 0.7.1 skips `onUnsubscribe` for an unsubscribe that overtakes its own subscribe, so the buffer used to survive and a later subscribe without `last_event_id` replayed stale messages.
+- A `pusher:subscribe` without `last_event_id` now drops any buffered replay for that channel first. A subscribe with a cursor that core then rejected (bad auth, subscription limit) used to leave its buffer until the socket closed, and a later subscribe without a cursor replayed it. Together with the unsubscribe fix above, a subscribe without `last_event_id` can no longer receive a stale replay by either path.
+
 ## [0.3.0] - 2026-09-02
 
 ### Changed
