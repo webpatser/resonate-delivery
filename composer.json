@@ -16,7 +16,7 @@
         "illuminate/contracts": "^13.0",
         "illuminate/support": "^13.0",
         "predis/predis": "^2.2",
-        "webpatser/fledge-fiber": "^13.29",
+        "webpatser/fledge-fiber": "^13.38",
         "webpatser/resonate": "^0.7.1"
     },
     "require-dev": {
