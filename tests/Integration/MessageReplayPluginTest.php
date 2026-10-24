@@ -49,7 +49,7 @@ it('relays a subscribe with no last_event_id and replays nothing', function () {
     expect($connection->messages)->toBe([]);
 });
 
-it('buffers the replay at intercept time and sends nothing before the subscribe', function () {
+it('only remembers the cursor at intercept time, before core authorized the subscribe', function () {
     $plugin = new MessageReplayPlugin;
     $app = app(ApplicationProvider::class)->findById('app-id');
     $connection = new FakeConnection('sock-1', $app);
@@ -66,14 +66,72 @@ it('buffers the replay at intercept time and sends nothing before the subscribe'
             'data' => ['channel' => 'private-foo', 'last_event_id' => $first],
         ]);
 
-        // The read is done, the frames are held, and the connection has not
-        // been written to: it has not joined the channel yet.
+        // Nothing is read and nothing is buffered: only the cursor waits for
+        // onSubscribe, which core calls for an authorized subscribe only.
         expect($disposition)->toBe(MessageDisposition::Relay)
-            ->and($connection->state('delivery.replay'))->toHaveKey('private-foo')
-            ->and($connection->state('delivery.replay')['private-foo'])->toHaveCount(1)
+            ->and($connection->state('delivery.cursors'))->toBe(['private-foo' => $first])
+            ->and($connection->hasState('delivery.replay'))->toBeFalse()
             ->and($connection->messages)->toBe([]);
     });
 });
+
+it('caps the pending cursors per connection and drops the oldest first', function () {
+    config()->set('resonate-delivery.replay_max_pending', 3);
+
+    $plugin = new MessageReplayPlugin;
+    $connection = new FakeConnection('sock-1', app(ApplicationProvider::class)->findById('app-id'));
+
+    runLoop(function () use ($plugin, $connection) {
+        $plugin->boot(new PluginContext(app(ChannelManager::class)));
+
+        foreach (range(1, 10) as $n) {
+            $plugin->onMessage($connection, [
+                'event' => 'pusher:subscribe',
+                'data' => ['channel' => 'private-orders.'.$n, 'last_event_id' => '0-0'],
+            ]);
+        }
+
+        // A repeat moves its channel to the newest slot.
+        $plugin->onMessage($connection, [
+            'event' => 'pusher:subscribe',
+            'data' => ['channel' => 'private-orders.8', 'last_event_id' => '5-0'],
+        ]);
+    });
+
+    expect($connection->state('delivery.cursors'))->toBe([
+        'private-orders.9' => '0-0',
+        'private-orders.10' => '0-0',
+        'private-orders.8' => '5-0',
+    ]);
+});
+
+it('ignores a malformed last_event_id and drops an earlier cursor for the channel', function (mixed $cursor) {
+    $plugin = new MessageReplayPlugin;
+    $connection = new FakeConnection('sock-1', app(ApplicationProvider::class)->findById('app-id'));
+
+    runLoop(function () use ($plugin, $connection, $cursor) {
+        $plugin->boot(new PluginContext(app(ChannelManager::class)));
+
+        $plugin->onMessage($connection, [
+            'event' => 'pusher:subscribe',
+            'data' => ['channel' => 'private-foo', 'last_event_id' => '0-0'],
+        ]);
+
+        $plugin->onMessage($connection, [
+            'event' => 'pusher:subscribe',
+            'data' => ['channel' => 'private-foo', 'last_event_id' => $cursor],
+        ]);
+    });
+
+    expect($connection->state('delivery.cursors'))->toBe([]);
+})->with([
+    'empty' => '',
+    'not an id' => 'latest',
+    'redis special id' => '+',
+    'trailing garbage' => '1-0 extra',
+    'oversized' => str_repeat('9', 300),
+    'not a string' => 12,
+]);
 
 it('replays every message newer than the stashed cursor on onSubscribe', function () {
     $plugin = new MessageReplayPlugin;
@@ -161,7 +219,7 @@ it('skips replay when nothing is newer than the cursor', function () {
     expect($connection->messages)->toBe([]);
 });
 
-it('forgets buffered replays entirely on connection close', function () {
+it('forgets pending cursors entirely on connection close', function () {
     $plugin = new MessageReplayPlugin;
     $app = app(ApplicationProvider::class)->findById('app-id');
     $connection = new FakeConnection('sock-1', $app);
@@ -177,10 +235,10 @@ it('forgets buffered replays entirely on connection close', function () {
         $plugin->onClose($connection);
     });
 
-    expect($connection->hasState('delivery.replay'))->toBeFalse();
+    expect($connection->hasState('delivery.cursors'))->toBeFalse();
 });
 
-it('drops a buffered replay for a channel the connection leaves', function () {
+it('drops a pending cursor for a channel the connection leaves', function () {
     $plugin = new MessageReplayPlugin;
     $app = app(ApplicationProvider::class)->findById('app-id');
     $connection = new FakeConnection('sock-1', $app);

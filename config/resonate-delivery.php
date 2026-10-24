@@ -89,17 +89,24 @@ return [
     | `replay_batch_size` is the XRANGE page size used while reading a missed
     | window.
     |
-    | `replay_max_messages` caps how many messages a single replay buffers for
+    | `replay_max_messages` caps how many messages a single replay sends to
     | one connection. The stream's own MAXLEN already bounds this, so the cap
     | only matters when retention is set far higher than a reconnecting client
     | could ever use; beyond it the replay is truncated and a warning logged.
     | Set 0 to remove the cap.
+    |
+    | `replay_max_pending` caps how many `last_event_id` cursors one connection
+    | may hold for subscribes core has not confirmed yet. A cursor is only read
+    | once core authorized the subscribe; one left by a rejected subscribe is
+    | dropped oldest first beyond this cap. Set 0 to remove the cap.
     |
     */
 
     'replay_batch_size' => (int) env('RESONATE_DELIVERY_BATCH_SIZE', 100),
 
     'replay_max_messages' => (int) env('RESONATE_DELIVERY_MAX_REPLAY', 10000),
+
+    'replay_max_pending' => (int) env('RESONATE_DELIVERY_MAX_PENDING', 100),
 
     /*
     |--------------------------------------------------------------------------

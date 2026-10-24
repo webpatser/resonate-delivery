@@ -16,7 +16,7 @@ Solves the single most common WebSocket complaint: "I dropped for 20 seconds and
 - **Ordered.** Everything replayed reaches the client before any live broadcast on that channel, and each side is in publish order. See [Ordering](#ordering).
 - **Duplicates can happen at the seam.** A message published exactly as a reconnecting client is subscribing may arrive both in the replay and as a live broadcast. The live copy always arrives second, so it never reorders anything; the client deduplicates on the monotonic `_replay_id`.
 - **Best-effort logging, never an availability risk.** If the delivery Redis is unreachable, the broadcast still goes out live; it is simply not logged and carries no `_replay_id`. A durability add-on must not be able to take down the broadcasting it was added to.
-- **Bounded replays.** One replay buffers at most `replay_max_messages` (default 10000) messages for a connection; beyond that it is truncated and logged. The stream's own `MAXLEN` normally bites first.
+- **Bounded replays.** One replay sends at most `replay_max_messages` (default 10000) messages to a connection, one `XRANGE` page in memory at a time; beyond that it is truncated and logged. The stream's own `MAXLEN` normally bites first. Nothing is read before core has authorized the subscribe.
 - **No ACK protocol.** This is not a message queue. A subscriber that goes away forever does not hold a slot in any per-subscriber outbox. Per-subscriber state lives only on the connection.
 - **Server broadcasts only.** `client-*` whispers between clients are not logged; they reach connected subscribers only.
 
@@ -80,16 +80,16 @@ For Laravel Echo and the JS Pusher client there is no built-in plug for this; co
 
 The guarantee is that a reconnecting client sees every replayed message before any live broadcast on that channel, with no interleaving.
 
-That is a stronger claim than it looks, because the replay reads Redis and the connection is a live socket the whole time. The plugin gets it by reading before the connection joins the channel, not after:
+That is a stronger claim than it looks, because the replay reads Redis and the connection is a live socket the whole time. The plugin gets it from core's subscribe hold:
 
-1. The `pusher:subscribe` interceptor reads the whole missed window into memory. The connection has not joined the channel yet, so a broadcast walking the channel's connection list cannot reach it; the reads can take as many round trips as they need.
-2. Resonate then joins the connection, sends `subscription_succeeded`, and calls every plugin's `onSubscribe`; this plugin writes the buffered frames there. From the join until the last `onSubscribe` has returned, Resonate (0.7.1+) holds every live frame for that connection and delivers them afterwards in arrival order. That holds on scaled presence channels, where Resonate waits for the fleet's member list before confirming, and when another plugin's `onSubscribe` waits on I/O.
+1. The `pusher:subscribe` interceptor only remembers the cursor. Core has not authorized the subscribe yet, so nothing touches Redis: a client cannot make the server read streams for channels it is not allowed into.
+2. Resonate then authorizes and joins the connection, sends `subscription_succeeded`, and calls every plugin's `onSubscribe`; this plugin reads the missed window there and writes it page by page. From the join until the last `onSubscribe` has returned, Resonate (0.7.1+) holds every live frame for that connection and delivers them afterwards in arrival order, however long the reads take. That holds on scaled presence channels, where Resonate waits for the fleet's member list before confirming, and when another plugin's `onSubscribe` waits on I/O.
 
-A message published after the final read therefore arrives live, after the replay, in order. Nothing is dropped at that seam. A message published just before the final read can arrive twice (replayed, then live); both copies carry the same `_replay_id`, so the client drops the second.
+A message published after the join therefore arrives live, after the replay, in order; anything published before it is in the stream the replay walks. Nothing is dropped at that seam. A message published between the join and the final read arrives twice (replayed, then live); both copies carry the same `_replay_id`, so the client drops the second.
 
 Two consequences worth knowing:
 
-- A subscribe carrying `last_event_id` completes slightly later than a plain one, by roughly the time it takes to read the missed window. Only that connection waits; the event loop is never blocked.
+- A subscribe carrying `last_event_id` finishes its `onSubscribe` pass later than a plain one, by roughly the time it takes to read the missed window. Only that connection waits; the event loop is never blocked. Live frames held during that time count against `max_outbound_queue_size`, like any other hold.
 - A connection that is already subscribed to the channel gets no replay, because it has missed nothing and replaying would push messages it has already seen behind ones it has not.
 
 ## Retention has two axes
@@ -112,7 +112,8 @@ Pick a window longer than the longest disconnect you intend to support. A client
 | `replay_id_field` | `_replay_id` | The `data` key that carries each message's stream id. |
 | `underlying` | `reverb` | Name of the broadcaster the wrapper delegates to. |
 | `replay_batch_size` | `100` | XRANGE page size during replay. |
-| `replay_max_messages` | `10000` | Most messages one replay buffers for a connection; beyond it the replay is truncated and logged. `0` removes the cap. |
+| `replay_max_messages` | `10000` | Most messages one replay sends to a connection; beyond it the replay is truncated and logged. `0` removes the cap. |
+| `replay_max_pending` | `100` | Most `last_event_id` cursors one connection holds for subscribes not yet confirmed; oldest dropped first. `0` removes the cap. |
 
 ## Requirements
 

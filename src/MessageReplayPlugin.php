@@ -22,60 +22,54 @@ use function Fledge\Async\Redis\createRedisClient;
  * Two phases, and which phase does the Redis work is the whole design:
  *
  *  - `onMessage(pusher:subscribe)` notices the optional `last_event_id` field
- *    in the subscribe data and, right there, reads every missed message from
- *    the channel's Redis Stream into an in-memory buffer on the connection.
- *    It always returns `Relay` so the standard subscribe flow runs untouched.
+ *    in the subscribe data and remembers it on the connection. It performs no
+ *    I/O: core has not authorized the subscribe yet, so nothing it does may
+ *    cost Redis a round trip or hold more than a few bytes. It always returns
+ *    `Relay` so the standard subscribe flow runs untouched.
  *
- *  - `onSubscribe(Connection, Channel)` fires after `subscription_succeeded`
- *    has been sent. It writes the buffered frames to the connection and
- *    clears the buffer. It performs no I/O of its own.
+ *  - `onSubscribe(Connection, Channel)` fires after core authorized the
+ *    subscribe, joined the connection and sent `subscription_succeeded`. It
+ *    takes the remembered cursor, reads every missed message from the
+ *    channel's Redis Stream and writes it to the connection page by page.
  *
- * ## Why the read happens before the subscribe
+ * ## Why reading in onSubscribe keeps the ordering
  *
  * The ordering guarantee is that replayed messages arrive after
- * `subscription_succeeded` and before any live broadcast. Before Resonate
- * 0.7.1, reading during `onSubscribe` could not honour that: the connection
- * was already in the channel by then, so every `XRANGE` round trip suspended
- * this fiber and let another fiber deliver a live broadcast to the same
- * socket. A client could see
- * replayed 5 and 6, then live 12, then replayed 7 through 11, and a monotonic
- * `_replay_id` cannot repair an inversion the client has already applied.
+ * `subscription_succeeded` and before any live broadcast. From the moment
+ * core (Resonate 0.7.1+) adds the connection to the channel, it holds every
+ * live frame for that connection until `subscription_succeeded` is out and
+ * every plugin's `onSubscribe` has returned, then delivers the held frames in
+ * arrival order. That holds however long `onSubscribe` suspends, so the
+ * `XRANGE` round trips done here can never let a live broadcast overtake the
+ * replay. (Before 0.7.1 they could, which is why earlier releases read the
+ * window from the interceptor, ahead of authorization.)
  *
- * Doing the reads from the interceptor removes the race rather than papering
- * over it. Two properties combine:
- *
- *  1. While the buffer is being filled the connection has not yet joined the
- *     channel, and a broadcast only walks the channel's connection list, so no
- *     live frame for that channel can reach the socket however long the reads
- *     take.
- *  2. From the moment core (Resonate 0.7.1+) adds the connection to the
- *     channel, it holds every live frame for that connection until
- *     `subscription_succeeded` is out and every plugin's `onSubscribe` has
- *     returned, then delivers the held frames in arrival order. That holds
- *     even when core suspends in between (a scaled presence channel asking
- *     the fleet for its members) or another plugin's `onSubscribe` suspends
- *     on I/O, so the replay written from `onSubscribe` always precedes both
- *     the held and the live frames.
- *
- * Nothing is lost at the far seam either. A message appended after the final
- * `XRANGE` reaches the connection live (held first if it lands during the
- * subscribe), after the replay and in order. A message appended just before
- * the final read may arrive twice (once replayed, once live, the live copy
- * second); that is the documented duplicate, and the client deduplicates on
- * `_replay_id`.
+ * Nothing is lost at the seam either. The connection joins the channel before
+ * the first read, so every broadcast from then on is held and delivered after
+ * the replay, and everything published before the join is already in the
+ * stream the read walks. A message published between the join and the final
+ * read arrives twice (once replayed, once live, the live copy second); that is
+ * the documented duplicate, and the client deduplicates on `_replay_id`.
  *
  * Connections that subscribe without `last_event_id` get no replay (the
  * normal Pusher experience), and neither does a connection already subscribed
- * to the channel, because a live subscriber has missed nothing. Buffered state
- * is cleared on flush, on `pusher:unsubscribe`, on a `pusher:subscribe`
- * without `last_event_id`, in `onUnsubscribe` and on connection close.
+ * to the channel, because a live subscriber has missed nothing. A remembered
+ * cursor is cleared when it is used, on `pusher:unsubscribe`, on a
+ * `pusher:subscribe` without `last_event_id`, in `onUnsubscribe` and on
+ * connection close. Cursors left by subscribes core rejected are bounded by
+ * `replay_max_pending`, oldest dropped first.
  */
 class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, ServerPlugin
 {
     /**
-     * The connection state key holding buffered replay frames per channel.
+     * The connection state key holding the pending replay cursor per channel.
      */
-    protected const string BUFFER = 'delivery.replay';
+    protected const string CURSORS = 'delivery.cursors';
+
+    /**
+     * The shape of a Redis Stream id a client may send as `last_event_id`.
+     */
+    protected const string CURSOR_PATTERN = '/^\d{1,20}(?:-\d{1,20})?$/';
 
     /**
      * The server API surface handed in at boot.
@@ -103,9 +97,14 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     protected int $batchSize;
 
     /**
-     * The most messages one replay may buffer. 0 removes the limit.
+     * The most messages one replay may send. 0 removes the limit.
      */
     protected int $maxMessages;
+
+    /**
+     * The most cursors one connection may hold for subscribes not yet confirmed. 0 removes the limit.
+     */
+    protected int $maxPending;
 
     /**
      * Boot the plugin: open the Redis client and resolve config.
@@ -118,22 +117,23 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
 
         $this->keys = new DeliveryKeys($config['key_prefix'] ?? 'delivery');
         $this->replayIdField = (string) ($config['replay_id_field'] ?? '_replay_id');
-        $this->batchSize = (int) ($config['replay_batch_size'] ?? 100);
+        $this->batchSize = max(1, (int) ($config['replay_batch_size'] ?? 100));
         $this->maxMessages = (int) ($config['replay_max_messages'] ?? 10000);
+        $this->maxPending = (int) ($config['replay_max_pending'] ?? 100);
         $this->redis = createRedisClient($this->makeConfig($config['connection'] ?? []));
     }
 
     /**
-     * Buffer the replay for a subscribe carrying `last_event_id`; relay everything.
+     * Remember the cursor of a subscribe carrying `last_event_id`; relay everything.
      *
-     * The read happens here, before the connection joins the channel, so it
-     * can take as many round trips as it needs without a live broadcast
-     * slipping in front of the replay.
+     * Core has not authorized the subscribe at this point, so this only
+     * records the cursor. The read waits for `onSubscribe`, which core calls
+     * for an authorized subscribe only.
      *
-     * A `pusher:unsubscribe` drops the channel's buffer here as well. Core
+     * A `pusher:unsubscribe` drops the channel's cursor here as well. Core
      * only calls `onUnsubscribe` for a subscription the plugins were told
      * about, so an unsubscribe that overtakes its own subscribe would
-     * otherwise leave the buffer behind for a later subscribe without
+     * otherwise leave the cursor behind for a later subscribe without
      * `last_event_id` to replay.
      *
      * @param  array{event?:mixed,data?:mixed}  $event
@@ -149,79 +149,76 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
         $data = (array) ($event['data'] ?? []);
         $channel = (string) ($data['channel'] ?? '');
 
+        if ($channel === '') {
+            return MessageDisposition::Relay;
+        }
+
         if ($type === 'pusher:unsubscribe') {
-            if ($channel !== '') {
-                $this->forget($from, $channel);
-            }
+            $this->forget($from, $channel);
 
             return MessageDisposition::Relay;
         }
 
         $lastId = $data['last_event_id'] ?? null;
 
-        // A subscribe without a cursor asks for no replay. Any buffer still
-        // held for the channel belongs to an earlier subscribe that core
-        // rejected (bad auth, subscription limit) and must not be flushed.
-        if ($channel === '') {
-            return MessageDisposition::Relay;
-        }
-
-        if (! is_string($lastId) || $lastId === '') {
+        // A subscribe without a usable cursor asks for no replay. Any cursor
+        // still held for the channel belongs to an earlier subscribe that core
+        // rejected (bad auth, subscription limit) and must not be used.
+        if (! is_string($lastId) || preg_match(self::CURSOR_PATTERN, $lastId) !== 1) {
             $this->forget($from, $channel);
 
             return MessageDisposition::Relay;
         }
 
-        if ($this->redis === null) {
-            return MessageDisposition::Relay;
-        }
-
         // A connection already in the channel is receiving live broadcasts, so
         // it has missed nothing and a replay would only reorder its stream.
-        if ($this->subscribedAlready($from, $channel)) {
+        if ($this->redis === null || $this->subscribedAlready($from, $channel)) {
+            $this->forget($from, $channel);
+
             return MessageDisposition::Relay;
         }
 
-        $buffered = $this->buffered($from);
-        $buffered[$channel] = $this->read($from->app()->id(), $channel, $lastId, $this->redis);
-
-        $from->setState(self::BUFFER, $buffered);
+        $this->remember($from, $channel, $lastId);
 
         return MessageDisposition::Relay;
     }
 
     /**
-     * Flush the buffered replay for a channel the connection just joined.
+     * Replay the missed window for a channel the connection just joined.
      *
-     * Core (0.7.1+) holds live frames for the connection from the moment it
-     * joins the channel until every plugin's `onSubscribe` has returned, so
-     * these replay frames always precede the held and live ones, even when
-     * core or another plugin suspends first. A live frame that overlaps the
-     * replay arrives after it and is deduplicated on `_replay_id`.
+     * Core calls this only after it authorized the subscribe, and (0.7.1+)
+     * holds live frames for the connection from the join until every
+     * plugin's `onSubscribe` has returned, so the replay written here always
+     * precedes the held and live frames, however long the reads take. A live
+     * frame that overlaps the replay arrives after it and is deduplicated on
+     * `_replay_id`.
      */
     public function onSubscribe(Connection $connection, Channel $channel): void
     {
-        $buffered = $this->buffered($connection);
         $name = $channel->name();
+        $cursors = $this->cursors($connection);
 
-        if (! array_key_exists($name, $buffered)) {
+        if (! array_key_exists($name, $cursors)) {
             return;
         }
 
-        $frames = $buffered[$name];
+        $lastId = $cursors[$name];
 
-        // One-shot: drop the buffer before sending so a later resubscribe
-        // without a new cursor cannot replay the same messages twice.
-        unset($buffered[$name]);
-        $connection->setState(self::BUFFER, $buffered);
+        // One-shot: drop the cursor before any I/O so neither a later
+        // resubscribe without a new cursor nor a subscribe of the same socket
+        // that runs while this one waits on Redis can replay it again.
+        unset($cursors[$name]);
+        $connection->setState(self::CURSORS, $cursors);
 
-        foreach ($frames as $frame) {
-            $connection->send($frame);
+        if ($this->redis === null) {
+            return;
         }
+
+        $this->replay($connection, $channel, $lastId, $this->redis);
     }
 
     /**
-     * Drop any buffered replay for a channel a connection leaves explicitly.
+     * Drop any pending cursor for a channel a connection leaves explicitly.
      */
     public function onUnsubscribe(Connection $connection, Channel $channel): void
     {
@@ -237,46 +234,41 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     }
 
     /**
-     * Drop every buffered replay on close.
-     *
-     * A subscribe that core then rejects (bad auth, subscription limit) never
-     * reaches `onSubscribe`, so its buffer is released here rather than living
-     * as long as the socket.
+     * Drop every pending cursor on close.
      */
     public function onClose(Connection $connection): void
     {
-        $connection->forgetState(self::BUFFER);
+        $connection->forgetState(self::CURSORS);
     }
 
     /**
-     * Read every message newer than the cursor into ready-to-send frames.
+     * Send every message newer than the cursor to the connection, page by page.
      *
-     * A read failure returns what was gathered so far rather than throwing:
-     * a short replay degrades the way an out-of-retention cursor already does,
-     * where a thrown interceptor would cost the client its subscribe.
-     *
-     * @return list<string>
+     * A read failure stops the replay where it is rather than throwing: a
+     * short replay degrades the way an out-of-retention cursor already does.
+     * Each page is sent as soon as it is read, so a replay holds at most one
+     * page in memory. A connection that left the channel while a page was
+     * being read (it closed) is not read for again.
      */
-    protected function read(string $appId, string $channel, string $lastId, RedisClient $redis): array
+    protected function replay(Connection $connection, Channel $channel, string $lastId, RedisClient $redis): void
     {
-        $key = $this->keys->streamKey($appId, $channel);
+        $name = $channel->name();
+        $key = $this->keys->streamKey($connection->app()->id(), $name);
         $cursor = '('.$lastId;
-        $frames = [];
+        $sent = 0;
 
         while (true) {
             try {
                 $raw = $redis->execute('XRANGE', $key, $cursor, '+', 'COUNT', (string) $this->batchSize);
             } catch (Throwable $e) {
-                Log::error('Delivery replay read failed on '.$channel.': '.$e->getMessage());
+                Log::error('Delivery replay read failed on '.$name.': '.$e->getMessage());
 
-                return $frames;
+                return;
             }
 
             if (! is_array($raw) || $raw === []) {
-                return $frames;
+                return;
             }
-
-            $latestId = $lastId;
 
             foreach ($raw as $entry) {
                 $decoded = is_array($entry) ? $this->decodeEntry($entry) : null;
@@ -288,30 +280,28 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
                 $augmented = $decoded['data'];
                 $augmented[$this->replayIdField] = $decoded['id'];
 
-                $frames[] = json_encode([
+                $connection->send(json_encode([
                     'event' => $decoded['event'],
-                    'channel' => $channel,
+                    'channel' => $name,
                     'data' => $augmented,
-                ], JSON_THROW_ON_ERROR);
+                ], JSON_THROW_ON_ERROR));
 
-                $latestId = $decoded['id'];
+                $cursor = '('.$decoded['id'];
 
                 // The stream's own MAXLEN already bounds a replay, so reaching
                 // this means retention is far larger than any client can use.
-                // Stop rather than hold an unbounded buffer per connection.
-                if ($this->maxMessages > 0 && count($frames) >= $this->maxMessages) {
-                    Log::error('Delivery replay on '.$channel.' truncated at '.$this->maxMessages.' messages.');
+                if ($this->maxMessages > 0 && ++$sent >= $this->maxMessages) {
+                    Log::error('Delivery replay on '.$name.' truncated at '.$this->maxMessages.' messages.');
 
-                    return $frames;
+                    return;
                 }
             }
 
-            // Less than a full batch means we caught up.
-            if (count($raw) < $this->batchSize) {
-                return $frames;
+            // Less than a full batch means we caught up. A connection that
+            // closed while that page was read is owed nothing more.
+            if (count($raw) < $this->batchSize || ! $channel->subscribed($connection)) {
+                return;
             }
-
-            $cursor = '('.$latestId;
         }
     }
 
@@ -327,42 +317,61 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     }
 
     /**
-     * Drop the buffered replay for one channel. A no-op when there is none.
+     * Remember the cursor for a channel, dropping the oldest beyond the pending cap.
      */
-    protected function forget(Connection $connection, string $channel): void
+    protected function remember(Connection $connection, string $channel, string $lastId): void
     {
-        $buffered = $this->buffered($connection);
+        $cursors = $this->cursors($connection);
 
-        if (! array_key_exists($channel, $buffered)) {
-            return;
+        // Re-inserting moves the channel to the end, so the cap drops the
+        // cursors of the oldest unconfirmed subscribes first.
+        unset($cursors[$channel]);
+        $cursors[$channel] = $lastId;
+
+        while ($this->maxPending > 0 && count($cursors) > $this->maxPending) {
+            unset($cursors[array_key_first($cursors)]);
         }
 
-        unset($buffered[$channel]);
-        $connection->setState(self::BUFFER, $buffered);
+        $connection->setState(self::CURSORS, $cursors);
     }
 
     /**
-     * The buffered replay frames held on a connection, keyed by channel.
-     *
-     * @return array<string, list<string>>
+     * Drop the pending cursor for one channel. A no-op when there is none.
      */
-    protected function buffered(Connection $connection): array
+    protected function forget(Connection $connection, string $channel): void
     {
-        $state = $connection->state(self::BUFFER, []);
+        $cursors = $this->cursors($connection);
+
+        if (! array_key_exists($channel, $cursors)) {
+            return;
+        }
+
+        unset($cursors[$channel]);
+        $connection->setState(self::CURSORS, $cursors);
+    }
+
+    /**
+     * The pending replay cursors held on a connection, keyed by channel.
+     *
+     * @return array<string, string>
+     */
+    protected function cursors(Connection $connection): array
+    {
+        $state = $connection->state(self::CURSORS, []);
 
         if (! is_array($state)) {
             return [];
         }
 
-        $buffered = [];
+        $cursors = [];
 
-        foreach ($state as $channel => $frames) {
-            $buffered[(string) $channel] = is_array($frames)
-                ? array_values(array_filter($frames, is_string(...)))
-                : [];
+        foreach ($state as $channel => $lastId) {
+            if (is_string($lastId)) {
+                $cursors[(string) $channel] = $lastId;
+            }
         }
 
-        return $buffered;
+        return $cursors;
     }
 
     /**

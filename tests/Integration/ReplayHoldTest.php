@@ -317,9 +317,13 @@ it('replays before every held broadcast on a scaled presence channel behind a su
 
     $rest = array_slice($frames, 1);
 
+    // The window is read in onSubscribe, after D and E were logged, so they are
+    // replayed and then delivered live again from core's hold.
     expect(array_map(fn (array $frame) => [$frame['event'], $frame['replayed']], $rest))->toBe([
         ['B', true],
         ['C', true],
+        ['D', true],
+        ['E', true],
         ['C', false],
         ['D', false],
         ['E', false],
@@ -346,8 +350,11 @@ it('replays before every held broadcast on a scaled presence channel behind a su
 
     expect($seen)->toBe(array_column($log->replaySince('app-id', 'presence-room', $cursor), 'id'));
 
-    // The two held broadcasts each arrive exactly once.
-    $ids = array_map(fn (array $frame) => $frame['data']['_replay_id'] ?? null, $rest);
+    // The two held broadcasts each arrive live exactly once.
+    $ids = array_map(
+        fn (array $frame) => $frame['data']['_replay_id'] ?? null,
+        array_filter($rest, fn (array $frame) => ! $frame['replayed']),
+    );
 
     expect($held)->toHaveCount(2);
 
@@ -391,8 +398,8 @@ it('does not replay a stale buffer after an unsubscribe overtook its own subscri
             return $reached;
         });
 
-        // The replay was read at intercept time and waits for onSubscribe.
-        expect($joiner->state('delivery.replay'))->toHaveKey('presence-room');
+        // The cursor was remembered at intercept time and waits for onSubscribe.
+        expect($joiner->state('delivery.cursors'))->toHaveKey('presence-room');
 
         deliveryLeave($joiner);
 
@@ -403,7 +410,7 @@ it('does not replay a stale buffer after an unsubscribe overtook its own subscri
         // Core dropped the overtaken subscribe without telling the plugins.
         expect($joiner->messages)->toBe([])
             ->and($recorder->hooks)->toBe([])
-            ->and($joiner->state('delivery.replay', []))->not->toHaveKey('presence-room');
+            ->and($joiner->state('delivery.cursors', []))->not->toHaveKey('presence-room');
 
         // A fresh subscribe without a cursor must not pick up the old window.
         deliveryJoin($joiner, 1);
@@ -414,17 +421,17 @@ it('does not replay a stale buffer after an unsubscribe overtook its own subscri
     expect($frames)->toHaveCount(1)
         ->and($frames[0]['event'])->toBe('pusher_internal:subscription_succeeded')
         ->and(array_filter($frames, fn (array $frame) => isset($frame['data']['_replay_id'])))->toBe([])
-        ->and($joiner->state('delivery.replay', []))->not->toHaveKey('presence-room')
+        ->and($joiner->state('delivery.cursors', []))->not->toHaveKey('presence-room')
         ->and($recorder->hooks)->toBe(['onSubscribe presence-room']);
 });
 
-it('drops a channel buffer on pusher:unsubscribe and tolerates repeats', function () {
+it('drops a channel cursor on pusher:unsubscribe and tolerates repeats', function () {
     $plugin = new MessageReplayPlugin;
     $connection = new FakeConnection('sock-1', $this->application);
 
-    $connection->setState('delivery.replay', [
-        'private-foo' => ['{"event":"A"}'],
-        'private-bar' => ['{"event":"B"}'],
+    $connection->setState('delivery.cursors', [
+        'private-foo' => '1-0',
+        'private-bar' => '2-0',
     ]);
 
     $unsubscribe = ['event' => 'pusher:unsubscribe', 'data' => ['channel' => 'private-foo']];
@@ -437,12 +444,12 @@ it('drops a channel buffer on pusher:unsubscribe and tolerates repeats', functio
         app(ChannelManager::class)->for($this->application)->findOrCreate('private-foo'),
     );
 
-    expect($connection->state('delivery.replay'))->toBe([
-        'private-bar' => ['{"event":"B"}'],
+    expect($connection->state('delivery.cursors'))->toBe([
+        'private-bar' => '2-0',
     ]);
 });
 
-it('does not replay the buffer of a rejected subscribe to a later subscribe without a cursor', function () {
+it('does not replay the cursor of a rejected subscribe to a later subscribe without a cursor', function () {
     $log = app(MessageLog::class);
 
     $cursor = $log->append('app-id', 'presence-room', 'A', ['n' => 1]);
@@ -456,7 +463,7 @@ it('does not replay the buffer of a rejected subscribe to a later subscribe with
 
         $channelData = (string) json_encode(['user_id' => 1, 'user_info' => ['name' => 'Joe']]);
 
-        // Bad auth: the interceptor reads the window, then core rejects the subscribe.
+        // Bad auth: the interceptor remembers the cursor, then core rejects the subscribe.
         app(Server::class)->message($joiner, (string) json_encode([
             'event' => 'pusher:subscribe',
             'data' => [
@@ -468,7 +475,7 @@ it('does not replay the buffer of a rejected subscribe to a later subscribe with
         ]));
 
         expect(app(ChannelManager::class)->for($joiner->app())->find('presence-room')?->subscribed($joiner) ?? false)->toBeFalse()
-            ->and($joiner->state('delivery.replay'))->toHaveKey('presence-room');
+            ->and($joiner->state('delivery.cursors'))->toHaveKey('presence-room');
 
         deliveryJoin($joiner, 1);
     });
@@ -480,5 +487,5 @@ it('does not replay the buffer of a rejected subscribe to a later subscribe with
 
     expect(array_column($frames, 'event'))->toBe(['pusher_internal:subscription_succeeded'])
         ->and(array_filter($frames, fn (array $frame) => isset($frame['data']['_replay_id'])))->toBe([])
-        ->and($joiner->state('delivery.replay', []))->not->toHaveKey('presence-room');
+        ->and($joiner->state('delivery.cursors', []))->not->toHaveKey('presence-room');
 });

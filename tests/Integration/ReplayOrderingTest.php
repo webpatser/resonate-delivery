@@ -73,20 +73,22 @@ it('delivers every replayed message before a live broadcast that races the repla
             'data' => ['channel' => 'orders', 'last_event_id' => $first],
         ]);
 
-        // 2. Core joins the connection to the channel and sends
-        //    subscription_succeeded. From here the connection is live.
+        // 2. Core holds live frames for the connection, joins it to the
+        //    channel and sends subscription_succeeded, as Resonate 0.7.1+ does.
+        $channel->hold($connection);
         $channel->subscribe($connection);
 
         // 3. Another fiber has a broadcast ready to go out on this channel.
-        //    It runs at the first suspension point, whenever that comes.
+        //    It runs at the first suspension point: the replay's first read.
         EventLoop::queue(static fn () => $channel->broadcast([
             'event' => 'LIVE',
             'channel' => 'orders',
             'data' => ['n' => 99],
         ]));
 
-        // 4. The plugin flushes the replay.
+        // 4. The plugin reads and sends the replay, then core releases the hold.
         $plugin->onSubscribe($connection, $channel);
+        $channel->release($connection);
 
         // Let the queued broadcast run before we assert.
         settle();
@@ -101,7 +103,7 @@ it('delivers every replayed message before a live broadcast that races the repla
         ->and($frames[3]['data'])->not->toHaveKey('_replay_id');
 });
 
-it('holds the replay back even when the live broadcast is queued before the subscribe', function () {
+it('delivers a broadcast queued before the subscribe after the replay', function () {
     $app = app(ApplicationProvider::class)->findById('app-id');
     $connection = new FakeConnection('sock-1', $app);
     $log = app(MessageLog::class);
@@ -116,9 +118,9 @@ it('holds the replay back even when the live broadcast is queued before the subs
         $plugin = new MessageReplayPlugin;
         $plugin->boot(new PluginContext(app(ChannelManager::class)));
 
-        // The broadcast is pending before the plugin does any work at all. It
-        // reaches nobody while it runs, because the connection has not joined
-        // the channel yet, which is what makes the read phase safe to suspend.
+        // The broadcast is pending before the plugin does any work at all. The
+        // interceptor does no I/O, so it first runs during the replay read,
+        // when the connection has joined and core is holding its frames.
         EventLoop::queue(static fn () => $channel->broadcast([
             'event' => 'EARLY',
             'channel' => 'orders',
@@ -130,14 +132,16 @@ it('holds the replay back even when the live broadcast is queued before the subs
             'data' => ['channel' => 'orders', 'last_event_id' => $first],
         ]);
 
+        $channel->hold($connection);
         $channel->subscribe($connection);
 
         $plugin->onSubscribe($connection, $channel);
+        $channel->release($connection);
 
         settle();
     });
 
-    expect(array_column(framesOf($connection), 'event'))->toBe(['B', 'C']);
+    expect(array_column(framesOf($connection), 'event'))->toBe(['B', 'C', 'EARLY']);
 });
 
 it('skips the replay for a connection already subscribed to the channel', function () {
