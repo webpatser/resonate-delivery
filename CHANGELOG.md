@@ -5,11 +5,25 @@ All notable changes to `webpatser/resonate-delivery` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-10-24
+
+Stable release. Requires `webpatser/resonate` `^1.0`. No API changes; see [UPGRADE.md](UPGRADE.md).
+
+### Changed
+
+- Require `webpatser/resonate` `^1.0` (was `^0.7`)
+
 ## [0.7.2] - 2026-10-24
 
 ### Security
 
 - The replay window is now read in `onSubscribe`, after Resonate authorized the subscribe, instead of in the `pusher:subscribe` interceptor. A client could make the server read up to `replay_max_messages` stream entries per channel it was not allowed into and park them on the connection until close. The interceptor now only remembers the cursor (capped by the new `replay_max_pending`, default 100, oldest dropped first), malformed `last_event_id` values are ignored, and a replay is sent page by page instead of buffered whole. Ordering is unchanged: Resonate 0.7.1+ holds live frames until `onSubscribe` returns. A message published during the read may now arrive twice more often (replayed, then live), deduplicated on `_replay_id` as before.
+
+## [0.7.1] - 2026-10-22
+
+### Changed
+
+- Raise the `webpatser/fledge-fiber` floor to `^13.38`.
 
 ## [0.7.0] - 2026-09-23
 
@@ -169,7 +183,13 @@ Initial release.
   the monotonic `_replay_id`.
 - **Server broadcasts only.** `client-*` whispers are not logged in v0.1.
 
-[Unreleased]: https://github.com/webpatser/resonate-delivery/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/webpatser/resonate-delivery/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/webpatser/resonate-delivery/compare/v0.7.2...v1.0.0
+[0.7.2]: https://github.com/webpatser/resonate-delivery/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/webpatser/resonate-delivery/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/webpatser/resonate-delivery/compare/v0.3.0...v0.7.0
+[0.3.0]: https://github.com/webpatser/resonate-delivery/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/webpatser/resonate-delivery/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/webpatser/resonate-delivery/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/webpatser/resonate-delivery/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/webpatser/resonate-delivery/compare/v0.1.0...v0.1.1
