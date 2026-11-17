@@ -238,6 +238,125 @@ it('forgets pending cursors entirely on connection close', function () {
     expect($connection->hasState('delivery.cursors'))->toBeFalse();
 });
 
+it('never remembers a cursor for a private-encrypted channel', function () {
+    $plugin = new MessageReplayPlugin;
+    $app = app(ApplicationProvider::class)->findById('app-id');
+    $connection = new FakeConnection('sock-1', $app);
+
+    // A stream written by an older release that still logged encrypted channels.
+    app(MessageLog::class)->append('app-id', 'private-encrypted-foo', 'Secret', ['pin' => '1234']);
+
+    $channel = app(ChannelManager::class)->for($app)->findOrCreate('private-encrypted-foo');
+
+    runLoop(function () use ($plugin, $connection, $channel) {
+        $plugin->boot(new PluginContext(app(ChannelManager::class)));
+
+        $plugin->onMessage($connection, [
+            'event' => 'pusher:subscribe',
+            'data' => ['channel' => 'private-encrypted-foo', 'last_event_id' => '0-0'],
+        ]);
+
+        expect($connection->state('delivery.cursors', []))->toBe([]);
+
+        $plugin->onSubscribe($connection, $channel);
+    });
+
+    expect($connection->messages)->toBe([]);
+});
+
+it('stops replaying once a connection used up its replays for the window', function () {
+    config()->set('resonate-delivery.replay_budget_replays', 3);
+    config()->set('resonate-delivery.replay_budget_messages', 0);
+
+    $plugin = new MessageReplayPlugin;
+    $app = app(ApplicationProvider::class)->findById('app-id');
+    $connection = new FakeConnection('sock-1', $app);
+    $log = app(MessageLog::class);
+
+    $log->append('app-id', 'private-foo', 'A', []);
+    $log->append('app-id', 'private-foo', 'B', []);
+
+    $channel = app(ChannelManager::class)->for($app)->findOrCreate('private-foo');
+
+    runLoop(function () use ($plugin, $connection, $channel) {
+        $plugin->boot(new PluginContext(app(ChannelManager::class)));
+
+        // The amplification loop: subscribe from the start, unsubscribe, repeat.
+        foreach (range(1, 10) as $n) {
+            $plugin->onMessage($connection, [
+                'event' => 'pusher:subscribe',
+                'data' => ['channel' => 'private-foo', 'last_event_id' => '0'],
+            ]);
+            $plugin->onSubscribe($connection, $channel);
+            $plugin->onMessage($connection, [
+                'event' => 'pusher:unsubscribe',
+                'data' => ['channel' => 'private-foo'],
+            ]);
+        }
+    });
+
+    // Three replays of two messages each, not ten.
+    expect($connection->messages)->toHaveCount(6);
+});
+
+it('stops replaying once a connection used up its message budget for the window', function () {
+    config()->set('resonate-delivery.replay_budget_replays', 0);
+    config()->set('resonate-delivery.replay_budget_messages', 5);
+
+    $plugin = new MessageReplayPlugin;
+    $app = app(ApplicationProvider::class)->findById('app-id');
+    $connection = new FakeConnection('sock-1', $app);
+    $log = app(MessageLog::class);
+
+    foreach (['A', 'B', 'C'] as $event) {
+        $log->append('app-id', 'private-foo', $event, []);
+    }
+
+    $channel = app(ChannelManager::class)->for($app)->findOrCreate('private-foo');
+
+    runLoop(function () use ($plugin, $connection, $channel) {
+        $plugin->boot(new PluginContext(app(ChannelManager::class)));
+
+        foreach (range(1, 4) as $n) {
+            $plugin->onMessage($connection, [
+                'event' => 'pusher:subscribe',
+                'data' => ['channel' => 'private-foo', 'last_event_id' => '0'],
+            ]);
+            $plugin->onSubscribe($connection, $channel);
+        }
+    });
+
+    // 3 + 2, then the budget is spent: 5 messages instead of 12.
+    expect($connection->messages)->toHaveCount(5);
+});
+
+it('replays without limit when both budgets are disabled', function () {
+    config()->set('resonate-delivery.replay_budget_replays', 0);
+    config()->set('resonate-delivery.replay_budget_messages', 0);
+
+    $plugin = new MessageReplayPlugin;
+    $app = app(ApplicationProvider::class)->findById('app-id');
+    $connection = new FakeConnection('sock-1', $app);
+
+    app(MessageLog::class)->append('app-id', 'private-foo', 'A', []);
+
+    $channel = app(ChannelManager::class)->for($app)->findOrCreate('private-foo');
+
+    runLoop(function () use ($plugin, $connection, $channel) {
+        $plugin->boot(new PluginContext(app(ChannelManager::class)));
+
+        foreach (range(1, 5) as $n) {
+            $plugin->onMessage($connection, [
+                'event' => 'pusher:subscribe',
+                'data' => ['channel' => 'private-foo', 'last_event_id' => '0'],
+            ]);
+            $plugin->onSubscribe($connection, $channel);
+        }
+    });
+
+    expect($connection->messages)->toHaveCount(5);
+});
+
 it('drops a pending cursor for a channel the connection leaves', function () {
     $plugin = new MessageReplayPlugin;
     $app = app(ApplicationProvider::class)->findById('app-id');

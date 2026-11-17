@@ -1,5 +1,6 @@
 <?php
 
+use Illuminate\Support\Facades\Log;
 use Predis\Client;
 use Webpatser\ResonateDelivery\Broadcasting\ReplayBroadcaster;
 use Webpatser\ResonateDelivery\MessageLog;
@@ -133,6 +134,57 @@ it('keeps delivering the remaining channels when one channel fails to log', func
     expect($underlying->calls)->toHaveCount(2)
         ->and($underlying->calls[0][2])->not->toHaveKey('_replay_id')
         ->and($underlying->calls[1][2]['_replay_id'])->toBe('1700000000000-0');
+});
+
+it('never logs a private-encrypted channel and delivers it live with the payload untouched', function () {
+    $underlying = new RecordingBroadcaster;
+    $log = app(MessageLog::class);
+
+    $broadcaster = new ReplayBroadcaster(
+        underlying: $underlying,
+        log: $log,
+        appId: 'app-id',
+    );
+
+    $broadcaster->broadcast(['private-encrypted-foo', 'private-foo'], 'Secret', ['pin' => '1234']);
+
+    expect($underlying->calls)->toHaveCount(2);
+
+    // The underlying Pusher driver encrypts this payload; it must reach it
+    // exactly as given, and nothing of it may land in Redis in plaintext.
+    expect($underlying->calls[0][0])->toBe(['private-encrypted-foo'])
+        ->and($underlying->calls[0][2])->toBe(['pin' => '1234'])
+        ->and($log->replaySince('app-id', 'private-encrypted-foo', '0-0'))->toBe([])
+        ->and($this->redis->keys('delivery-test:*private-encrypted-foo*'))->toBe([]);
+
+    // A plain private channel in the same call is still logged.
+    expect($underlying->calls[1][2]['_replay_id'])->toMatch('/^\d+-\d+$/')
+        ->and($log->replaySince('app-id', 'private-foo', '0-0'))->toHaveCount(1);
+});
+
+it('does not even attempt to log a private-encrypted channel', function () {
+    $underlying = new RecordingBroadcaster;
+
+    $broadcaster = new ReplayBroadcaster(
+        underlying: $underlying,
+        log: new class extends FailingMessageLog
+        {
+            public function append(string $appId, string $channel, string $event, array $data): string
+            {
+                throw new LogicException('append called for '.$channel);
+            }
+        },
+        appId: 'app-id',
+    );
+
+    Log::spy();
+
+    $broadcaster->broadcast(['private-encrypted-foo'], 'Secret', ['pin' => '1234']);
+
+    Log::shouldNotHaveReceived('error');
+
+    expect($underlying->calls)->toHaveCount(1)
+        ->and($underlying->calls[0][2])->toBe(['pin' => '1234']);
 });
 
 it('delegates auth unchanged', function () {

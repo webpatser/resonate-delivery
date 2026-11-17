@@ -28,6 +28,11 @@ use Webpatser\ResonateDelivery\MessageLog;
 class ReplayBroadcaster implements Broadcaster
 {
     /**
+     * The channel prefix of end-to-end encrypted channels, which are never logged.
+     */
+    public const string ENCRYPTED_PREFIX = 'private-encrypted-';
+
+    /**
      * Create a new broadcaster.
      */
     public function __construct(
@@ -75,6 +80,16 @@ class ReplayBroadcaster implements Broadcaster
         foreach ($channels as $channel) {
             $name = (string) $channel;
             $augmented = $payload;
+
+            // End-to-end encrypted channels are live-only. The underlying
+            // Pusher driver encrypts the payload inside its own trigger, so
+            // logging here would store the plaintext in Redis and replay it
+            // to clients. No log entry also means no `_replay_id`.
+            if (str_starts_with($name, self::ENCRYPTED_PREFIX)) {
+                $this->underlying->broadcast([$channel], $event, $payload);
+
+                continue;
+            }
 
             try {
                 $augmented[$this->replayIdField] = $this->log->append($this->appId, $name, (string) $event, $payload);

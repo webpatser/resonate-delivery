@@ -110,6 +110,34 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Replay budget per connection
+    |--------------------------------------------------------------------------
+    |
+    | Every replay is a fresh read of the stream, so a client that loops
+    | subscribe (`last_event_id` = 0) and unsubscribe could pull the full
+    | stream again and again. The budget caps what one connection gets per
+    | `replay_budget_window` seconds: at most `replay_budget_replays` replays
+    | and `replay_budget_messages` replayed messages. Over budget the subscribe
+    | still succeeds, it just gets no (or a truncated) replay, and one warning
+    | per window is logged; the client gets no signal, only a gap. With the
+    | default retention of about 1000 messages per stream, 10000 messages is
+    | roughly 10 full streams per window: a client resubscribing to more
+    | channels than that, each with a full missed window, is cut short.
+    | The window is clamped to at least 1 second, so 0 does not disable the
+    | budget; set both caps to 0 to restore the old, unlimited behaviour.
+    | Pair this with your own connection rate limiting: the budget lives on
+    | the connection, so a new connection starts afresh.
+    |
+    */
+
+    'replay_budget_window' => (int) env('RESONATE_DELIVERY_BUDGET_WINDOW', 60),
+
+    'replay_budget_replays' => (int) env('RESONATE_DELIVERY_BUDGET_REPLAYS', 100),
+
+    'replay_budget_messages' => (int) env('RESONATE_DELIVERY_BUDGET_MESSAGES', 10000),
+
+    /*
+    |--------------------------------------------------------------------------
     | Underlying broadcaster
     |--------------------------------------------------------------------------
     |

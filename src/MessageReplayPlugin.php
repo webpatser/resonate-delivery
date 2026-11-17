@@ -13,6 +13,7 @@ use Webpatser\Resonate\Plugins\Contracts\ServerPlugin;
 use Webpatser\Resonate\Plugins\MessageDisposition;
 use Webpatser\Resonate\Plugins\PluginContext;
 use Webpatser\Resonate\Protocols\Pusher\Channels\Channel;
+use Webpatser\ResonateDelivery\Broadcasting\ReplayBroadcaster;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -57,7 +58,9 @@ use function Fledge\Async\Redis\createRedisClient;
  * cursor is cleared when it is used, on `pusher:unsubscribe`, on a
  * `pusher:subscribe` without `last_event_id`, in `onUnsubscribe` and on
  * connection close. Cursors left by subscribes core rejected are bounded by
- * `replay_max_pending`, oldest dropped first.
+ * `replay_max_pending`, oldest dropped first. Replays per connection are
+ * bounded by a budget per window (`replay_budget_*`), and `private-encrypted-`
+ * channels are never replayed.
  */
 class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, ServerPlugin
 {
@@ -65,6 +68,11 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
      * The connection state key holding the pending replay cursor per channel.
      */
     protected const string CURSORS = 'delivery.cursors';
+
+    /**
+     * The connection state key holding the replay budget of the current window.
+     */
+    protected const string BUDGET = 'delivery.budget';
 
     /**
      * The shape of a Redis Stream id a client may send as `last_event_id`.
@@ -107,6 +115,21 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     protected int $maxPending;
 
     /**
+     * The length of one replay budget window, in seconds.
+     */
+    protected int $budgetWindow;
+
+    /**
+     * The most replays one connection may start per window. 0 removes the limit.
+     */
+    protected int $budgetReplays;
+
+    /**
+     * The most replayed messages one connection may receive per window. 0 removes the limit.
+     */
+    protected int $budgetMessages;
+
+    /**
      * Boot the plugin: open the Redis client and resolve config.
      */
     public function boot(PluginContext $context): void
@@ -120,6 +143,9 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
         $this->batchSize = max(1, (int) ($config['replay_batch_size'] ?? 100));
         $this->maxMessages = (int) ($config['replay_max_messages'] ?? 10000);
         $this->maxPending = (int) ($config['replay_max_pending'] ?? 100);
+        $this->budgetWindow = max(1, (int) ($config['replay_budget_window'] ?? 60));
+        $this->budgetReplays = (int) ($config['replay_budget_replays'] ?? 100);
+        $this->budgetMessages = (int) ($config['replay_budget_messages'] ?? 10000);
         $this->redis = createRedisClient($this->makeConfig($config['connection'] ?? []));
     }
 
@@ -172,7 +198,11 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
 
         // A connection already in the channel is receiving live broadcasts, so
         // it has missed nothing and a replay would only reorder its stream.
-        if ($this->redis === null || $this->subscribedAlready($from, $channel)) {
+        // Encrypted channels are live-only and never replayed, even from a
+        // stream an older release may have written for them.
+        if ($this->redis === null
+            || str_starts_with($channel, ReplayBroadcaster::ENCRYPTED_PREFIX)
+            || $this->subscribedAlready($from, $channel)) {
             $this->forget($from, $channel);
 
             return MessageDisposition::Relay;
@@ -210,7 +240,7 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
         unset($cursors[$name]);
         $connection->setState(self::CURSORS, $cursors);
 
-        if ($this->redis === null) {
+        if ($this->redis === null || ! $this->admitReplay($connection, $name)) {
             return;
         }
 
@@ -239,6 +269,7 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
     public function onClose(Connection $connection): void
     {
         $connection->forgetState(self::CURSORS);
+        $connection->forgetState(self::BUDGET);
     }
 
     /**
@@ -277,6 +308,12 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
                     continue;
                 }
 
+                // Charged per message, so replays of the same connection that
+                // run concurrently share one budget.
+                if (! $this->chargeMessage($connection, $name)) {
+                    return;
+                }
+
                 $augmented = $decoded['data'];
                 $augmented[$this->replayIdField] = $decoded['id'];
 
@@ -288,8 +325,9 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
 
                 $cursor = '('.$decoded['id'];
 
-                // The stream's own MAXLEN already bounds a replay, so reaching
-                // this means retention is far larger than any client can use.
+                // With the default retention the stream's MAXLEN (about 1000
+                // entries) ends a replay well before this cap (default 10000),
+                // so reaching it means retention is set above the cap.
                 if ($this->maxMessages > 0 && ++$sent >= $this->maxMessages) {
                     Log::error('Delivery replay on '.$name.' truncated at '.$this->maxMessages.' messages.');
 
@@ -303,6 +341,99 @@ class MessageReplayPlugin implements ConnectionLifecycle, MessageInterceptor, Se
                 return;
             }
         }
+    }
+
+    /**
+     * Count one replay against the connection's budget; false when it is spent.
+     *
+     * Without a budget a client could loop subscribe(`last_event_id` = 0) and
+     * unsubscribe to pull the whole stream again and again. Over budget the
+     * subscribe still succeeds, it just gets no replay (the plain Pusher
+     * experience).
+     */
+    protected function admitReplay(Connection $connection, string $channel): bool
+    {
+        if ($this->budgetReplays <= 0 && $this->budgetMessages <= 0) {
+            return true;
+        }
+
+        $budget = $this->budget($connection);
+
+        if (($this->budgetReplays > 0 && $budget['replays'] >= $this->budgetReplays)
+            || ($this->budgetMessages > 0 && $budget['messages'] >= $this->budgetMessages)) {
+            $this->exhausted($connection, $budget, $channel);
+
+            return false;
+        }
+
+        $budget['replays']++;
+        $connection->setState(self::BUDGET, $budget);
+
+        return true;
+    }
+
+    /**
+     * Count one replayed message against the connection's budget; false when it is spent.
+     */
+    protected function chargeMessage(Connection $connection, string $channel): bool
+    {
+        if ($this->budgetMessages <= 0) {
+            return true;
+        }
+
+        $budget = $this->budget($connection);
+
+        if ($budget['messages'] >= $this->budgetMessages) {
+            $this->exhausted($connection, $budget, $channel);
+
+            return false;
+        }
+
+        $budget['messages']++;
+        $connection->setState(self::BUDGET, $budget);
+
+        return true;
+    }
+
+    /**
+     * Log a spent budget once per window, so a looping client cannot flood the log.
+     *
+     * @param  array{start: float, replays: int, messages: int, warned: bool}  $budget
+     */
+    protected function exhausted(Connection $connection, array $budget, string $channel): void
+    {
+        if ($budget['warned']) {
+            return;
+        }
+
+        $budget['warned'] = true;
+        $connection->setState(self::BUDGET, $budget);
+
+        Log::error('Delivery replay budget spent for connection '.$connection->id().' on '.$channel.'; replays skipped or truncated until the window ends.');
+    }
+
+    /**
+     * The connection's replay budget for the current window, reset once the window elapsed.
+     *
+     * @return array{start: float, replays: int, messages: int, warned: bool}
+     */
+    protected function budget(Connection $connection): array
+    {
+        $now = hrtime(true) / 1e9;
+        $state = $connection->state(self::BUDGET);
+
+        if (! is_array($state)
+            || ! is_float($state['start'] ?? null)
+            || $now - $state['start'] >= $this->budgetWindow) {
+            return ['start' => $now, 'replays' => 0, 'messages' => 0, 'warned' => false];
+        }
+
+        return [
+            'start' => $state['start'],
+            'replays' => (int) ($state['replays'] ?? 0),
+            'messages' => (int) ($state['messages'] ?? 0),
+            'warned' => (bool) ($state['warned'] ?? false),
+        ];
     }
 
     /**
