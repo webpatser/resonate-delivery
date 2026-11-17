@@ -17,6 +17,9 @@ Solves the single most common WebSocket complaint: "I dropped for 20 seconds and
 - **Duplicates can happen at the seam.** A message published exactly as a reconnecting client is subscribing may arrive both in the replay and as a live broadcast. The live copy always arrives second, so it never reorders anything; the client deduplicates on the monotonic `_replay_id`.
 - **Best-effort logging, never an availability risk.** If the delivery Redis is unreachable, the broadcast still goes out live; it is simply not logged and carries no `_replay_id`. A durability add-on must not be able to take down the broadcasting it was added to.
 - **Bounded replays.** One replay sends at most `replay_max_messages` (default 10000) messages to a connection, one `XRANGE` page in memory at a time; beyond that it is truncated and logged. The stream's own `MAXLEN` normally bites first. Nothing is read before core has authorized the subscribe.
+- **Replay budget per connection.** Each connection may start at most `replay_budget_replays` replays (default 100) and receive at most `replay_budget_messages` replayed messages (default 10000) per `replay_budget_window` seconds (default 60), so a client looping subscribe and unsubscribe from `last_event_id` 0 cannot pull the stream over and over. Over budget the subscribe still succeeds, without a replay or with a shortened one. With the default retention of about 1000 messages per stream, 10000 messages is roughly 10 full streams per window. The window is clamped to at least 1 second, so `0` there does not disable anything; set both caps to `0` to restore the previous, unlimited behaviour. The budget lives on the connection, so pair it with your own connection rate limiting.
+- **A shortened replay is silent.** When a replay is cut short by the budget or by `replay_max_messages`, the client receives no signal; it simply has a gap between the last replayed message and the first live one.
+- **Encrypted channels are live-only.** `private-encrypted-*` channels are never logged and never replayed, and carry no `_replay_id`. The underlying Pusher driver encrypts their payload end to end; logging it would put the plaintext in Redis. Older releases did log them: those plaintext streams stay in Redis until their `retention.ttl` expires (forever with `ttl` 0). Delete them, for example `redis-cli --scan --pattern 'delivery:*:private-encrypted-*' | xargs redis-cli del` (substitute your `key_prefix` for `delivery`).
 - **No ACK protocol.** This is not a message queue. A subscriber that goes away forever does not hold a slot in any per-subscriber outbox. Per-subscriber state lives only on the connection.
 - **Server broadcasts only.** `client-*` whispers between clients are not logged; they reach connected subscribers only.
 
@@ -114,6 +117,9 @@ Pick a window longer than the longest disconnect you intend to support. A client
 | `replay_batch_size` | `100` | XRANGE page size during replay. |
 | `replay_max_messages` | `10000` | Most messages one replay sends to a connection; beyond it the replay is truncated and logged. `0` removes the cap. |
 | `replay_max_pending` | `100` | Most `last_event_id` cursors one connection holds for subscribes not yet confirmed; oldest dropped first. `0` removes the cap. |
+| `replay_budget_window` | `60` | Length in seconds of one per-connection replay budget window. Clamped to at least `1`; `0` does not disable the budget (set both caps to `0` for that). |
+| `replay_budget_replays` | `100` | Most replays one connection may start per window; over it a subscribe gets no replay. `0` removes the cap. |
+| `replay_budget_messages` | `10000` | Most replayed messages one connection may receive per window; over it replays stop. `0` removes the cap. |
 
 ## Requirements
 

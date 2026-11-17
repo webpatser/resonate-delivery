@@ -5,6 +5,16 @@ All notable changes to `webpatser/resonate-delivery` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Broadcasts to `private-encrypted-*` channels are delivered live only. They are no longer written to the replay stream in Redis and are never replayed, and replay cursors sent for those channels are ignored. Streams written by earlier releases stay in Redis until their TTL expires; the README gives the key pattern to delete them.
+
+### Added
+
+- Per-connection replay budget: `replay_budget_window` (seconds, default 60, minimum 1), `replay_budget_replays` (default 100) and `replay_budget_messages` (default 10000). A connection that spends its budget gets no replay, or a shortened one, until the window ends, and the client receives no signal. Setting both caps to 0 disables the budget.
+
 ## [1.0.0] - 2026-10-24
 
 Stable release. Requires `webpatser/resonate` `^1.0`. No API changes; see [UPGRADE.md](UPGRADE.md).
